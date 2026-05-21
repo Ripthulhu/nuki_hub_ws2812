@@ -1,0 +1,403 @@
+diff --git a/src/Gpio.cpp b/src/Gpio.cpp
+index b456b25..075b3bf 100644
+--- a/src/Gpio.cpp
++++ b/src/Gpio.cpp
+@@ -1,4 +1,6 @@
+ #include <esp32-hal.h>
++#include <algorithm>
++#include "driver/gpio.h"
+ #include "Gpio.h"
+ #include "Config.h"
+ #include "Arduino.h"
+@@ -15,6 +17,7 @@ Gpio::Gpio(Preferences* preferences)
+     : _preferences(preferences)
+ {
+     _inst = this;
++    _ws2812 = new Ws2812StatusLed(preferences);
+     _inst->init();
+ }
+ 
+@@ -24,6 +27,10 @@ bool Gpio::isTriggered(const PinEntry& entry)
+ //    Log->println(" ------------ ");
+ 
+     const int threshold = 3;
++    if(entry.pin >= _triggerState.size())
++    {
++        return false;
++    }
+ 
+     uint8_t state = digitalRead(entry.pin);
+     uint8_t lastState = (_triggerState[entry.pin] & 0x80) >> 7;
+@@ -113,15 +120,39 @@ void Gpio::isrOnTimer()
+ 
+ void Gpio::init()
+ {
+-    _inst->_triggerState.reserve(_inst->availablePins().size());
+-    for(int i=0; i<_inst->availablePins().size(); i++)
++    _inst->_triggerState.assign(GPIO_NUM_MAX, 0);
++    if(_inst->_ws2812 != nullptr)
+     {
+-        _inst->_triggerState.push_back(0);
++        _inst->_ws2812->begin();
+     }
++    _inst->startWs2812Task();
+ 
+     _inst->setPins();
+ }
+ 
++void Gpio::startWs2812Task()
++{
++    if(_ws2812 == nullptr || _ws2812Task != nullptr)
++    {
++        return;
++    }
++
++    xTaskCreate(ws2812Task, "ws2812", 3072, this, 1, &_ws2812Task);
++}
++
++void Gpio::ws2812Task(void* parameter)
++{
++    Gpio* gpio = static_cast<Gpio*>(parameter);
++    while(true)
++    {
++        if(gpio != nullptr && gpio->_ws2812 != nullptr)
++        {
++            gpio->_ws2812->update();
++        }
++        vTaskDelay(pdMS_TO_TICKS(10));
++    }
++}
++
+ void Gpio::setPins()
+ {
+     loadPinConfiguration();
+@@ -184,6 +215,7 @@ void Gpio::setPins()
+         case PinRole::OutputHighBluetoothComm:
+             pinMode(entry.pin, OUTPUT);
+             break;
++        case PinRole::Ws2812Data:
+         case PinRole::Ethernet:
+         default:
+             break;
+@@ -257,7 +289,14 @@ void Gpio::loadPinConfiguration()
+         }
+         if(entry.role != PinRole::Disabled)
+         {
+-            _pinConfiguration.push_back(entry);
++            if(entry.role == PinRole::Ws2812Data)
++            {
++                _preferences->putInt(preference_ws2812_gpio, entry.pin);
++            }
++            else
++            {
++                _pinConfiguration.push_back(entry);
++            }
+         }
+     }
+ }
+@@ -388,6 +427,7 @@ void Gpio::savePinConfiguration(const std::vector<PinEntry> &pinConfiguration)
+     memset(serialized, 0, sizeof(serialized));
+ 
+     std::vector<int> disabledPins = getDisabledPins();
++    int ws2812Pin = -1;
+ 
+     int len = pinConfiguration.size();
+     for(int i=0; i < len; i++)
+@@ -396,6 +436,14 @@ void Gpio::savePinConfiguration(const std::vector<PinEntry> &pinConfiguration)
+         Log->print("Pin ");
+         Log->println(entry.pin);
+ 
++        if(entry.role == PinRole::Ws2812Data)
++        {
++            ws2812Pin = entry.pin;
++            Log->print("Role: ");
++            Log->println(getRoleDescription(entry.role));
++            continue;
++        }
++
+         if(std::find(disabledPins.begin(), disabledPins.end(), entry.pin) != disabledPins.end())
+         {
+             serialized[i * 2] = entry.pin;
+@@ -407,7 +455,7 @@ void Gpio::savePinConfiguration(const std::vector<PinEntry> &pinConfiguration)
+         }
+         else
+         {
+-            if(entry.role != PinRole::Disabled && entry.role != PinRole::Ethernet)
++            if(entry.role != PinRole::Disabled && entry.role != PinRole::Ethernet && entry.role != PinRole::Ws2812Data)
+             {
+                 serialized[i * 2] = entry.pin;
+                 serialized[i * 2 + 1] = (int8_t) entry.role;
+@@ -418,7 +466,9 @@ void Gpio::savePinConfiguration(const std::vector<PinEntry> &pinConfiguration)
+         }
+     }
+ 
++    _preferences->putInt(preference_ws2812_gpio, ws2812Pin);
+     _preferences->putBytes(preference_gpio_configuration, serialized, sizeof(serialized));
++    reloadWs2812();
+ }
+ 
+ const std::vector<PinEntry> &Gpio::pinConfiguration() const
+@@ -428,6 +478,11 @@ const std::vector<PinEntry> &Gpio::pinConfiguration() const
+ 
+ const PinRole Gpio::getPinRole(const int &pin) const
+ {
++    if(pin >= 0 && _preferences->getInt(preference_ws2812_gpio, -1) == pin)
++    {
++        return PinRole::Ws2812Data;
++    }
++
+     for(const auto& pinEntry : _pinConfiguration)
+     {
+         if(pinEntry.pin == pin)
+@@ -509,6 +564,8 @@ String Gpio::getRoleDescription(const PinRole& role) const
+         return "Output: High on bluetooth communication active";
+     case PinRole::OutputHighBluetoothCommError:
+         return "Output: High on bluetooth communication error";
++    case PinRole::Ws2812Data:
++        return "WS2812/NeoPixel data";
+     default:
+         return "Unknown";
+     }
+@@ -559,6 +616,7 @@ GpioAction Gpio::getGpioAction(const PinRole &role) const
+     case PinRole::OutputHighNetworkConnected:
+     case PinRole::OutputHighBluetoothComm:
+     case PinRole::OutputHighBluetoothCommError:
++    case PinRole::Ws2812Data:
+     default:
+         return GpioAction::None;
+     }
+@@ -582,6 +640,20 @@ void Gpio::getConfigurationText(String& text, const std::vector<PinEntry>& pinCo
+             text.concat(linebreak);
+         }
+     }
++
++    int ws2812Pin = _preferences->getInt(preference_ws2812_gpio, -1);
++    if(ws2812Pin > -1)
++    {
++        text.concat("GPIO ");
++        text.concat(ws2812Pin);
++        if(ws2812Pin < 10)
++        {
++            text.concat(' ');
++        }
++        text.concat(": ");
++        text.concat(getRoleDescription(PinRole::Ws2812Data));
++        text.concat(linebreak);
++    }
+ }
+ 
+ const std::vector<PinRole>& Gpio::getAllRoles() const
+@@ -602,6 +674,46 @@ void Gpio::addCallback(std::function<void(const GpioAction&, const int&)> callba
+     _callbacks.push_back(callback);
+ }
+ 
++void Gpio::update()
++{
++    if(_ws2812 != nullptr && _ws2812Task == nullptr)
++    {
++        _ws2812->update();
++    }
++}
++
++void Gpio::reloadWs2812()
++{
++    if(_ws2812 != nullptr)
++    {
++        _ws2812->reload();
++    }
++}
++
++void Gpio::testWs2812()
++{
++    if(_ws2812 != nullptr)
++    {
++        _ws2812->test();
++    }
++}
++
++void Gpio::triggerWs2812(Ws2812Trigger trigger)
++{
++    if(_ws2812 != nullptr)
++    {
++        _ws2812->trigger(trigger);
++    }
++}
++
++void Gpio::setWs2812TriggerState(Ws2812Trigger trigger, bool active)
++{
++    if(_ws2812 != nullptr)
++    {
++        _ws2812->setTriggerState(trigger, active);
++    }
++}
++
+ void Gpio::setPinOutput(const uint8_t& pin, const uint8_t& state)
+ {
+     digitalWrite(pin, state);
+diff --git a/src/Gpio.h b/src/Gpio.h
+index 59e86a6..7cdae79 100644
+--- a/src/Gpio.h
++++ b/src/Gpio.h
+@@ -4,6 +4,9 @@
+ #include <functional>
+ #include <Preferences.h>
+ #include <vector>
++#include "freertos/FreeRTOS.h"
++#include "freertos/task.h"
++#include "Ws2812StatusLed.h"
+ 
+ enum class PinRole
+ {
+@@ -32,7 +35,8 @@ enum class PinRole
+     OutputHighMqttConnected,
+     OutputHighNetworkConnected,
+     OutputHighBluetoothCommError,
+-    OutputHighBluetoothComm
++    OutputHighBluetoothComm,
++    Ws2812Data
+ };
+ 
+ enum class GpioAction
+@@ -81,6 +85,12 @@ public:
+ 
+     const std::vector<PinRole>& getAllRoles() const;
+ 
++    void update();
++    void reloadWs2812();
++    void testWs2812();
++    void triggerWs2812(Ws2812Trigger trigger);
++    void setWs2812TriggerState(Ws2812Trigger trigger, bool active);
++
+     void setPinOutput(const uint8_t& pin, const uint8_t& state);
+     void setPins();
+ 
+@@ -90,13 +100,15 @@ private:
+     bool IRAM_ATTR isTriggered(const PinEntry& pinEntry);
+     GpioAction IRAM_ATTR getGpioAction(const PinRole& role) const;
+     static void IRAM_ATTR isrOnTimer();
++    static void ws2812Task(void* parameter);
++    void startWs2812Task();
+ 
+ #if defined(CONFIG_IDF_TARGET_ESP32C3)
+     //Based on https://docs.espressif.com/projects/esp-idf/en/latest/esp32c3/api-reference/peripherals/gpio.html and https://www.espressif.com/sites/default/files/documentation/esp32-c3_datasheet_en.pdf
+     const std::vector<uint8_t> _availablePins = { 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 18, 19, 20, 21 };
+ #elif defined(CONFIG_IDF_TARGET_ESP32S3)
+     //Based on https://github.com/atomic14/esp32-s3-pinouts?tab=readme-ov-file and https://docs.espressif.com/projects/esp-idf/en/latest/esp32s3/api-reference/peripherals/gpio.html and https://www.espressif.com/sites/default/files/documentation/esp32-s3_datasheet_en.pdf
+-    const std::vector<uint8_t> _availablePins = { 1, 2, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 21, 38, 39, 40, 41, 42 };
++    const std::vector<uint8_t> _availablePins = { 1, 2, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 21, 38, 39, 40, 41, 42, 47, 48 };
+ #elif defined(CONFIG_IDF_TARGET_ESP32C5)
+     //Based on https://docs.espressif.com/projects/esp-idf/en/latest/esp32c5/api-reference/peripherals/gpio.html and https://www.espressif.com/sites/default/files/documentation/esp32-c5_datasheet_en.pdf
+     const std::vector<uint8_t> _availablePins = { 0, 1, 3, 4, 5, 6, 8, 9, 10, 11, 12, 15, 23, 24, 26 };
+@@ -142,6 +154,7 @@ private:
+         PinRole::GeneralInputPullDown,
+         PinRole::GeneralInputPullUp,
+         PinRole::GeneralOutput,
++        PinRole::Ws2812Data,
+         PinRole::Ethernet
+     };
+ 
+@@ -153,8 +166,10 @@ private:
+ 
+     std::vector<uint8_t> _triggerState;
+     hw_timer_t* timer = nullptr;
++    TaskHandle_t _ws2812Task = nullptr;
+ 
+     bool _first = true;
+ 
+     Preferences* _preferences = nullptr;
++    Ws2812StatusLed* _ws2812 = nullptr;
+ };
+diff --git a/src/NukiNetwork.cpp b/src/NukiNetwork.cpp
+index 305e10d..bdcd298 100644
+--- a/src/NukiNetwork.cpp
++++ b/src/NukiNetwork.cpp
+@@ -685,6 +685,9 @@ void NukiNetwork::updateNetworkStatusLeds()
+     bool mqttConnected = _device->mqttConnected();
+     bool networkConnected = _device->isConnected();
+ 
++    _gpio->setWs2812TriggerState(Ws2812Trigger::MqttConnected, mqttConnected);
++    _gpio->setWs2812TriggerState(Ws2812Trigger::NetworkConnected, networkConnected);
++
+     for (uint8_t pin : _pinsMqttConnected)
+     {
+         _gpio->setPinOutput(pin, mqttConnected ? HIGH : LOW);
+@@ -1440,6 +1443,10 @@ void NukiNetwork::parseGpioTopics(const espMqttClientTypes::MessageProperties &p
+ void NukiNetwork::gpioActionCallback(const GpioAction &action, const int &pin)
+ {
+     _gpioTs[pin] = espMillis();
++    if(action == GpioAction::GeneralInput)
++    {
++        _gpio->triggerWs2812(Ws2812Trigger::GeneralInput);
++    }
+ }
+ 
+ void NukiNetwork::disableAutoRestarts()
+diff --git a/src/NukiNetworkOpener.cpp b/src/NukiNetworkOpener.cpp
+index 40c34fd..b3aa49f 100644
+--- a/src/NukiNetworkOpener.cpp
++++ b/src/NukiNetworkOpener.cpp
+@@ -9,9 +9,10 @@
+ #include "util/NukiHelper.h"
+ #include "util/NukiOpenerHelper.h"
+ 
+-NukiNetworkOpener::NukiNetworkOpener(NukiNetwork* network, Preferences* preferences, char* buffer, size_t bufferSize)
++NukiNetworkOpener::NukiNetworkOpener(NukiNetwork* network, Preferences* preferences, Gpio* gpio, char* buffer, size_t bufferSize)
+     : _preferences(preferences),
+       _network(network),
++      _gpio(gpio),
+       _buffer(buffer),
+       _bufferSize(bufferSize)
+ {
+@@ -687,11 +688,19 @@ void NukiNetworkOpener::publishAuthorizationInfo(const std::list<NukiOpener::Log
+                 if((log.data[0] & 3) == 0)
+                 {
+                     Log->println("Nuki opener: Ring detected (Locked)");
++                    if(_gpio != nullptr)
++                    {
++                        _gpio->triggerWs2812(Ws2812Trigger::DoorbellRing);
++                    }
+                     publishRing(true);
+                 }
+                 else
+                 {
+                     Log->println("Nuki opener: Ring detected (Open)");
++                    if(_gpio != nullptr)
++                    {
++                        _gpio->triggerWs2812(Ws2812Trigger::DoorbellRing);
++                    }
+                     publishRing(false);
+                 }
+             }
+@@ -1506,4 +1515,4 @@ uint8_t NukiNetworkOpener::queryCommands()
+ void NukiNetworkOpener::setupHASS(int type, uint32_t nukiId, char* nukiName, const char* firmwareVersion, const char* hardwareVersion, bool hasDoorSensor, bool hasKeypad)
+ {
+     _network->setupHASS(type, nukiId, nukiName, firmwareVersion, hardwareVersion, hasDoorSensor, hasKeypad);
+-}
+\ No newline at end of file
++}
+diff --git a/src/NukiNetworkOpener.h b/src/NukiNetworkOpener.h
+index 13b8782..a7bd89e 100644
+--- a/src/NukiNetworkOpener.h
++++ b/src/NukiNetworkOpener.h
+@@ -7,11 +7,12 @@
+ #include "NukiOpenerConstants.h"
+ #include "NukiNetworkLock.h"
+ #include "EspMillis.h"
++#include "Gpio.h"
+ 
+ class NukiNetworkOpener : public MqttReceiver
+ {
+ public:
+-    explicit NukiNetworkOpener(NukiNetwork* network, Preferences* preferences, char* buffer, size_t bufferSize);
++    explicit NukiNetworkOpener(NukiNetwork* network, Preferences* preferences, Gpio* gpio, char* buffer, size_t bufferSize);
+     virtual ~NukiNetworkOpener() = default;
+ 
+     void initialize();
+@@ -67,6 +68,7 @@ private:
+ 
+     NukiNetwork* _network = nullptr;
+     NukiPublisher* _nukiPublisher = nullptr;
++    Gpio* _gpio = nullptr;
+ 
+     std::map<uint32_t, String> _authEntries;
+     char _mqttPath[181] = {0};
