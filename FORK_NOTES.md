@@ -52,6 +52,8 @@ Generated build output, local dependency folders, and Codex working directories 
 
 ## GitHub Actions
 
-This fork adds a focused workflow for the ESP32-S3 octal PSRAM target. It can be run manually from the GitHub Actions tab and also runs on pushes to the WS2812 branch.
+This fork adds a focused workflow for the ESP32-S3 octal PSRAM target. It runs on pushes to the WS2812 branch and on pull requests targeting `master`.
 
 The workflow applies `patches/ws2812-status-led/*.patch`, builds the updater and firmware, checks that the OTA image fits the app slot, and uploads the `release/esp32s3oct` folder as an artifact.
+
+GitHub only exposes the manual `workflow_dispatch` button for workflows present on the repository default branch. If you want a manual "Run workflow" button, copy or merge `.github/workflows/ws2812-s3-oct.yml` onto `master`; the patch stack can still stay on `ws2812-status-led`.
