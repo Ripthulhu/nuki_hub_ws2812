@@ -1,0 +1,1100 @@
+diff --git a/src/Ws2812StatusLed.cpp b/src/Ws2812StatusLed.cpp
+new file mode 100644
+index 0000000..bfe4f16
+--- /dev/null
++++ b/src/Ws2812StatusLed.cpp
+@@ -0,0 +1,1094 @@
++#include "Ws2812StatusLed.h"
++
++#include "EspMillis.h"
++#include "Logger.h"
++#include "PreferencesKeys.h"
++#include "driver/gpio.h"
++#include "esp_err.h"
++#include "freertos/FreeRTOS.h"
++#include "freertos/semphr.h"
++#include "led_strip.h"
++#include "led_strip_rmt.h"
++
++namespace
++{
++constexpr uint8_t DEFAULT_BRIGHTNESS = 32;
++constexpr int64_t MIN_REFRESH_INTERVAL = 10;
++constexpr uint8_t LEGACY_RAINBOW_FAST_EFFECT = 24;
++constexpr uint16_t RAINBOW_CYCLE_MS = 3600;
++constexpr uint16_t DOORBELL_MIN_DURATION_MS = 15000;
++
++const Ws2812Trigger TRIGGER_PRIORITY[] =
++{
++    Ws2812Trigger::BluetoothCommError,
++    Ws2812Trigger::LockMotorBlocked,
++    Ws2812Trigger::BluetoothComm,
++    Ws2812Trigger::RtoOrCmActive,
++    Ws2812Trigger::RtoActive,
++    Ws2812Trigger::CmActive,
++    Ws2812Trigger::LockUnlocked,
++    Ws2812Trigger::LockLocked,
++    Ws2812Trigger::MqttConnected,
++    Ws2812Trigger::NetworkConnected,
++    Ws2812Trigger::Startup
++};
++
++class Ws2812MutexGuard
++{
++public:
++    explicit Ws2812MutexGuard(void* mutex)
++        : _mutex(static_cast<SemaphoreHandle_t>(mutex))
++    {
++        _locked = _mutex == nullptr || xSemaphoreTakeRecursive(_mutex, portMAX_DELAY) == pdTRUE;
++    }
++
++    ~Ws2812MutexGuard()
++    {
++        if(_mutex != nullptr && _locked)
++        {
++            xSemaphoreGiveRecursive(_mutex);
++        }
++    }
++
++    bool locked() const
++    {
++        return _locked;
++    }
++
++private:
++    SemaphoreHandle_t _mutex = nullptr;
++    bool _locked = false;
++};
++
++uint8_t scaleComponent(uint8_t component, uint8_t brightness)
++{
++    return static_cast<uint8_t>((static_cast<uint16_t>(component) * brightness) / 255);
++}
++
++uint8_t scale8(uint8_t value, uint8_t scale)
++{
++    return static_cast<uint8_t>((static_cast<uint16_t>(value) * scale) / 255);
++}
++
++uint8_t triangle8(uint16_t phase, uint16_t periodMs)
++{
++    uint16_t pos = static_cast<uint16_t>((static_cast<uint32_t>(phase) * 510) / periodMs);
++    return static_cast<uint8_t>(pos <= 255 ? pos : 510 - pos);
++}
++
++uint8_t ease8InOutQuad(uint8_t value)
++{
++    uint16_t x = value;
++    if(x < 128)
++    {
++        return static_cast<uint8_t>((x * x) / 128);
++    }
++
++    x = 255 - x;
++    return static_cast<uint8_t>(255 - ((x * x) / 128));
++}
++
++uint8_t hash8(uint32_t value)
++{
++    value ^= value >> 16;
++    value *= 0x7feb352d;
++    value ^= value >> 15;
++    value *= 0x846ca68b;
++    value ^= value >> 16;
++    return static_cast<uint8_t>(value);
++}
++
++uint16_t hashHue(uint32_t value)
++{
++    return static_cast<uint16_t>((static_cast<uint16_t>(hash8(value)) * 360) / 255);
++}
++
++uint8_t clampBrightness(int brightness)
++{
++    if(brightness < 1)
++    {
++        return 1;
++    }
++    if(brightness > 255)
++    {
++        return 255;
++    }
++    return static_cast<uint8_t>(brightness);
++}
++}
++
++Ws2812StatusLed::Ws2812StatusLed(Preferences* preferences)
++    : _preferences(preferences)
++{
++    _updateMutex = xSemaphoreCreateRecursiveMutex();
++    loadSettings();
++}
++
++Ws2812StatusLed::~Ws2812StatusLed()
++{
++    {
++        Ws2812MutexGuard guard(_updateMutex);
++        if(guard.locked())
++        {
++            deleteStrip();
++        }
++    }
++    if(_updateMutex != nullptr)
++    {
++        vSemaphoreDelete(static_cast<SemaphoreHandle_t>(_updateMutex));
++        _updateMutex = nullptr;
++    }
++}
++
++void Ws2812StatusLed::begin()
++{
++    Ws2812MutexGuard guard(_updateMutex);
++    if(!guard.locked())
++    {
++        return;
++    }
++
++    loadSettings();
++    if(configureStrip())
++    {
++        trigger(Ws2812Trigger::Startup);
++    }
++}
++
++void Ws2812StatusLed::reload()
++{
++    Ws2812MutexGuard guard(_updateMutex);
++    if(!guard.locked())
++    {
++        return;
++    }
++
++    loadSettings();
++    if(configureStrip())
++    {
++        trigger(Ws2812Trigger::Startup);
++    }
++}
++
++void Ws2812StatusLed::loadSettings()
++{
++    _pin = _preferences->getInt(preference_ws2812_gpio, -1);
++    _defaultBrightness = clampBrightness(_preferences->getInt(preference_ws2812_brightness, DEFAULT_BRIGHTNESS));
++    _brightness = _defaultBrightness;
++    loadEffects(_preferences, _effects);
++    loadBrightnesses(_preferences, _triggerBrightness, _defaultBrightness);
++}
++
++bool Ws2812StatusLed::configureStrip()
++{
++    if(_pin < 0 || _pin >= GPIO_NUM_MAX)
++    {
++        deleteStrip();
++        return false;
++    }
++
++    if(_strip != nullptr && _activePin == _pin)
++    {
++        return true;
++    }
++
++    deleteStrip();
++
++    led_strip_config_t stripConfig = {};
++    stripConfig.strip_gpio_num = _pin;
++    stripConfig.max_leds = 1;
++    stripConfig.led_model = LED_MODEL_WS2812;
++    stripConfig.color_component_format = LED_STRIP_COLOR_COMPONENT_FMT_GRB;
++    stripConfig.flags.invert_out = false;
++
++    led_strip_rmt_config_t rmtConfig = {};
++    rmtConfig.clk_src = RMT_CLK_SRC_DEFAULT;
++    rmtConfig.resolution_hz = 10 * 1000 * 1000;
++    rmtConfig.mem_block_symbols = 64;
++    rmtConfig.flags.with_dma = false;
++
++    led_strip_handle_t strip = nullptr;
++    esp_err_t err = led_strip_new_rmt_device(&stripConfig, &rmtConfig, &strip);
++    if(err != ESP_OK)
++    {
++        Log->print("WS2812 init failed on GPIO ");
++        Log->print(_pin);
++        Log->print(": ");
++        Log->println(esp_err_to_name(err));
++        _strip = nullptr;
++        _activePin = -1;
++        return false;
++    }
++
++    _strip = strip;
++    _activePin = _pin;
++    _lastColor = 0xffffffff;
++    clear();
++    return true;
++}
++
++void Ws2812StatusLed::deleteStrip()
++{
++    if(_strip == nullptr)
++    {
++        return;
++    }
++
++    led_strip_handle_t strip = static_cast<led_strip_handle_t>(_strip);
++    led_strip_clear(strip);
++    led_strip_del(strip);
++    _strip = nullptr;
++    _activePin = -1;
++    _lastColor = 0xffffffff;
++}
++
++void Ws2812StatusLed::clear()
++{
++    if(_strip == nullptr)
++    {
++        return;
++    }
++
++    led_strip_handle_t strip = static_cast<led_strip_handle_t>(_strip);
++    led_strip_clear(strip);
++    _lastColor = 0;
++}
++
++void Ws2812StatusLed::update()
++{
++    Ws2812MutexGuard guard(_updateMutex);
++    if(!guard.locked())
++    {
++        return;
++    }
++
++    if(_strip == nullptr && !configureStrip())
++    {
++        return;
++    }
++
++    int64_t now = espMillis();
++    if(now - _lastRefresh < MIN_REFRESH_INTERVAL)
++    {
++        return;
++    }
++    _lastRefresh = now;
++
++    uint8_t brightness = _defaultBrightness;
++    Ws2812Effect effect = currentEffect(now, brightness);
++    _brightness = brightness;
++    render(effect, now);
++}
++
++void Ws2812StatusLed::test()
++{
++    Ws2812MutexGuard guard(_updateMutex);
++    if(!guard.locked())
++    {
++        return;
++    }
++
++    loadSettings();
++    if(!configureStrip())
++    {
++        return;
++    }
++
++    _momentaryEffect = Ws2812Effect::DoubleFlashWhite;
++    _momentaryBrightness = _triggerBrightness[static_cast<uint8_t>(Ws2812Trigger::DoorbellRing)];
++    _momentaryStartedAt = espMillis();
++    _momentaryUntil = _momentaryStartedAt + 3000;
++    _lastRefresh = 0;
++    update();
++}
++
++void Ws2812StatusLed::trigger(Ws2812Trigger trigger)
++{
++    Ws2812MutexGuard guard(_updateMutex);
++    if(!guard.locked())
++    {
++        return;
++    }
++
++    if(static_cast<uint8_t>(trigger) >= WS2812_TRIGGER_COUNT)
++    {
++        return;
++    }
++
++    uint8_t index = static_cast<uint8_t>(trigger);
++    Ws2812Effect effect = _effects[index];
++    if(effect == Ws2812Effect::Disabled)
++    {
++        return;
++    }
++
++    uint16_t duration = momentaryDuration(trigger, effect);
++    if(duration == 0)
++    {
++        return;
++    }
++
++    int64_t now = espMillis();
++    _momentaryEffect = effect;
++    _momentaryBrightness = _triggerBrightness[index];
++    _momentaryStartedAt = now;
++    _momentaryUntil = now + duration;
++}
++
++void Ws2812StatusLed::setTriggerState(Ws2812Trigger trigger, bool active)
++{
++    Ws2812MutexGuard guard(_updateMutex);
++    if(!guard.locked())
++    {
++        return;
++    }
++
++    if(static_cast<uint8_t>(trigger) >= WS2812_TRIGGER_COUNT)
++    {
++        return;
++    }
++
++    _activeTriggers[static_cast<uint8_t>(trigger)] = active;
++}
++
++bool Ws2812StatusLed::enabled() const
++{
++    return _pin >= 0;
++}
++
++int Ws2812StatusLed::pin() const
++{
++    return _pin;
++}
++
++uint8_t Ws2812StatusLed::brightness() const
++{
++    return _defaultBrightness;
++}
++
++Ws2812Effect Ws2812StatusLed::effectForTrigger(Ws2812Trigger trigger) const
++{
++    if(static_cast<uint8_t>(trigger) >= WS2812_TRIGGER_COUNT)
++    {
++        return Ws2812Effect::Disabled;
++    }
++
++    return _effects[static_cast<uint8_t>(trigger)];
++}
++
++Ws2812Effect Ws2812StatusLed::currentEffect(int64_t now, uint8_t& brightness)
++{
++    brightness = _defaultBrightness;
++    if(_momentaryEffect != Ws2812Effect::Disabled)
++    {
++        if(now < _momentaryUntil)
++        {
++            brightness = _momentaryBrightness;
++            return _momentaryEffect;
++        }
++        _momentaryEffect = Ws2812Effect::Disabled;
++        _momentaryBrightness = _defaultBrightness;
++        _momentaryStartedAt = 0;
++        _momentaryUntil = 0;
++    }
++
++    for(const Ws2812Trigger trigger : TRIGGER_PRIORITY)
++    {
++        uint8_t index = static_cast<uint8_t>(trigger);
++        if(_activeTriggers[index] && _effects[index] != Ws2812Effect::Disabled)
++        {
++            brightness = _triggerBrightness[index];
++            return _effects[index];
++        }
++    }
++
++    return Ws2812Effect::Disabled;
++}
++
++void Ws2812StatusLed::render(Ws2812Effect effect, int64_t now)
++{
++    if(effect != Ws2812Effect::BlinkWhite)
++    {
++        _shortBlinkActive = false;
++        _shortBlinkNextAt = 0;
++        _shortBlinkOffAt = 0;
++    }
++
++    switch(effect)
++    {
++    case Ws2812Effect::Off:
++    case Ws2812Effect::Disabled:
++        setColor(0, 0, 0);
++        break;
++    case Ws2812Effect::SolidGreen:
++        setColor(0, 255, 0);
++        break;
++    case Ws2812Effect::SolidRed:
++        setColor(255, 0, 0);
++        break;
++    case Ws2812Effect::SolidBlue:
++        setColor(0, 0, 255);
++        break;
++    case Ws2812Effect::SolidAmber:
++        setColor(255, 120, 0);
++        break;
++    case Ws2812Effect::SolidWhite:
++        setColor(255, 255, 255);
++        break;
++    case Ws2812Effect::BlinkGreen:
++        renderBlink(0, 255, 0, 350, now);
++        break;
++    case Ws2812Effect::BlinkRed:
++        renderBlink(255, 0, 0, 350, now);
++        break;
++    case Ws2812Effect::BlinkBlue:
++        renderBlink(0, 0, 255, 350, now);
++        break;
++    case Ws2812Effect::BlinkAmber:
++        renderBlink(255, 120, 0, 350, now);
++        break;
++    case Ws2812Effect::FlashWhite:
++        renderBlink(255, 255, 255, 90, now);
++        break;
++    case Ws2812Effect::FlashGreen:
++        renderBlink(0, 255, 0, 90, now);
++        break;
++    case Ws2812Effect::FlashRed:
++        renderBlink(255, 0, 0, 90, now);
++        break;
++    case Ws2812Effect::FlashBlue:
++        renderBlink(0, 0, 255, 90, now);
++        break;
++    case Ws2812Effect::PulseBlue:
++        renderPulse(0, 0, 255, 800, now);
++        break;
++    case Ws2812Effect::PulseGreen:
++        renderPulse(0, 255, 0, 800, now);
++        break;
++    case Ws2812Effect::Rainbow:
++    {
++        led_strip_handle_t strip = static_cast<led_strip_handle_t>(_strip);
++        uint16_t hue = static_cast<uint16_t>((now / 10) % 360);
++        led_strip_set_pixel_hsv(strip, 0, hue, 255, _brightness);
++        led_strip_refresh(strip);
++        _lastColor = 0xffffffff;
++        break;
++    }
++    case Ws2812Effect::BlinkWhite:
++        renderShortBlink(255, 255, 255, 2000, 50, now);
++        break;
++    case Ws2812Effect::PulseWhite:
++        renderPulse(255, 255, 255, 800, now);
++        break;
++    case Ws2812Effect::PulseAmber:
++        renderPulse(255, 120, 0, 800, now);
++        break;
++    case Ws2812Effect::DoubleFlashWhite:
++        renderDoubleFlash(255, 255, 255, 650, now);
++        break;
++    case Ws2812Effect::DoubleFlashRed:
++        renderDoubleFlash(255, 0, 0, 650, now);
++        break;
++    case Ws2812Effect::PoliceRedBlue:
++        renderPoliceRedBlue(720, now);
++        break;
++    case Ws2812Effect::LegacyRainbowFast:
++        render(Ws2812Effect::Rainbow, now);
++        break;
++    case Ws2812Effect::BreathBlue:
++        renderBreath(0, 0, 255, 1600, now);
++        break;
++    case Ws2812Effect::BreathGreen:
++        renderBreath(0, 255, 0, 1600, now);
++        break;
++    case Ws2812Effect::BreathAmber:
++        renderBreath(255, 120, 0, 1600, now);
++        break;
++    case Ws2812Effect::BreathWhite:
++        renderBreath(255, 255, 255, 1600, now);
++        break;
++    case Ws2812Effect::HeartbeatWhite:
++        renderHeartbeat(255, 255, 255, 1500, now);
++        break;
++    case Ws2812Effect::HeartbeatRed:
++        renderHeartbeat(255, 0, 0, 1500, now);
++        break;
++    case Ws2812Effect::TwinkleWhite:
++        renderTwinkle(255, 255, 255, 900, now);
++        break;
++    case Ws2812Effect::FireFlicker:
++        renderFireFlicker(now);
++        break;
++    case Ws2812Effect::PrismSprint:
++        renderPrismSprint(now);
++        break;
++    case Ws2812Effect::RainbowBeat:
++        renderRainbowBeat(now);
++        break;
++    case Ws2812Effect::PartySparkle:
++        renderPartySparkle(now);
++        break;
++    case Ws2812Effect::ColorBurst:
++        renderColorBurst(now);
++        break;
++    case Ws2812Effect::ElectricZap:
++        renderElectricZap(now);
++        break;
++    default:
++        setColor(0, 0, 0);
++        break;
++    }
++}
++
++void Ws2812StatusLed::renderBlink(uint8_t red, uint8_t green, uint8_t blue, uint16_t periodMs, int64_t now)
++{
++    if(((now / periodMs) % 2) == 0)
++    {
++        setColor(red, green, blue);
++    }
++    else
++    {
++        setColor(0, 0, 0);
++    }
++}
++
++void Ws2812StatusLed::renderShortBlink(uint8_t red, uint8_t green, uint8_t blue, uint16_t intervalMs, uint16_t onMs, int64_t now)
++{
++    if(_shortBlinkNextAt == 0 || now >= _shortBlinkNextAt)
++    {
++        _shortBlinkActive = true;
++        _shortBlinkOffAt = now + onMs;
++        _shortBlinkNextAt = now + intervalMs;
++    }
++
++    if(_shortBlinkActive && now < _shortBlinkOffAt)
++    {
++        setColor(red, green, blue);
++    }
++    else
++    {
++        _shortBlinkActive = false;
++        setColor(0, 0, 0);
++    }
++}
++
++void Ws2812StatusLed::renderPulse(uint8_t red, uint8_t green, uint8_t blue, uint16_t periodMs, int64_t now)
++{
++    uint16_t phase = static_cast<uint16_t>(now % periodMs);
++    uint16_t halfPeriod = periodMs / 2;
++    uint8_t scale;
++
++    if(phase < halfPeriod)
++    {
++        scale = static_cast<uint8_t>(20 + ((235 * phase) / halfPeriod));
++    }
++    else
++    {
++        scale = static_cast<uint8_t>(255 - ((235 * (phase - halfPeriod)) / halfPeriod));
++    }
++
++    setColorScaled(red, green, blue, scale);
++}
++
++void Ws2812StatusLed::renderBreath(uint8_t red, uint8_t green, uint8_t blue, uint16_t periodMs, int64_t now)
++{
++    uint16_t phase = static_cast<uint16_t>(now % periodMs);
++    uint8_t eased = ease8InOutQuad(triangle8(phase, periodMs));
++    uint8_t scale = static_cast<uint8_t>(8 + scale8(eased, 247));
++    setColorScaled(red, green, blue, scale);
++}
++
++void Ws2812StatusLed::renderHeartbeat(uint8_t red, uint8_t green, uint8_t blue, uint16_t periodMs, int64_t now)
++{
++    uint16_t phase = static_cast<uint16_t>(now % periodMs);
++    uint8_t scale = 0;
++
++    if(phase < 80)
++    {
++        scale = static_cast<uint8_t>(50 + ((205 * phase) / 80));
++    }
++    else if(phase < 220)
++    {
++        scale = static_cast<uint8_t>(255 - ((235 * (phase - 80)) / 140));
++    }
++    else if(phase >= 310 && phase < 390)
++    {
++        scale = static_cast<uint8_t>(35 + ((180 * (phase - 310)) / 80));
++    }
++    else if(phase >= 390 && phase < 570)
++    {
++        scale = static_cast<uint8_t>(215 - ((195 * (phase - 390)) / 180));
++    }
++
++    setColorScaled(red, green, blue, scale);
++}
++
++void Ws2812StatusLed::renderTwinkle(uint8_t red, uint8_t green, uint8_t blue, uint16_t periodMs, int64_t now)
++{
++    uint32_t slot = static_cast<uint32_t>(now / periodMs);
++    uint16_t phase = static_cast<uint16_t>(now % periodMs);
++    uint16_t start = static_cast<uint16_t>((hash8(slot) * static_cast<uint16_t>(periodMs - 220)) / 255);
++
++    if(phase < start || phase >= start + 220)
++    {
++        setColor(0, 0, 0);
++        return;
++    }
++
++    uint16_t sparklePhase = phase - start;
++    uint8_t scale = sparklePhase < 55
++        ? static_cast<uint8_t>((255 * sparklePhase) / 55)
++        : static_cast<uint8_t>(255 - ((255 * (sparklePhase - 55)) / 165));
++    setColorScaled(red, green, blue, scale);
++}
++
++void Ws2812StatusLed::renderFireFlicker(int64_t now)
++{
++    uint32_t bucket = static_cast<uint32_t>(now / 70);
++    uint8_t warmth = static_cast<uint8_t>(70 + (hash8(bucket) % 120));
++    uint8_t intensity = static_cast<uint8_t>(145 + (hash8(bucket + 37) % 111));
++
++    if((bucket % 9) == 0)
++    {
++        intensity = scale8(intensity, 150);
++    }
++
++    setColorScaled(255, warmth, hash8(bucket + 73) % 18, intensity);
++}
++
++void Ws2812StatusLed::renderPrismSprint(int64_t now)
++{
++    setHsv(static_cast<uint16_t>((now / 2) % 360), 255, 255);
++}
++
++void Ws2812StatusLed::renderRainbowBeat(int64_t now)
++{
++    uint16_t phase = static_cast<uint16_t>(now % 360);
++    uint8_t eased = ease8InOutQuad(triangle8(phase, 360));
++    uint8_t value = static_cast<uint8_t>(35 + scale8(eased, 220));
++    setHsv(static_cast<uint16_t>((now / 3) % 360), 255, value);
++}
++
++void Ws2812StatusLed::renderPartySparkle(int64_t now)
++{
++    uint32_t slot = static_cast<uint32_t>(now / 90);
++    uint16_t phase = static_cast<uint16_t>(now % 90);
++    uint8_t value = phase < 20
++        ? static_cast<uint8_t>((255 * phase) / 20)
++        : static_cast<uint8_t>(255 - ((255 * (phase - 20)) / 70));
++    setHsv(hashHue(slot), 255, value);
++}
++
++void Ws2812StatusLed::renderColorBurst(int64_t now)
++{
++    uint16_t phase = static_cast<uint16_t>(now % 720);
++    uint8_t burst = phase / 120;
++    uint8_t burstPhase = phase % 120;
++
++    if(burstPhase >= 88)
++    {
++        setColor(0, 0, 0);
++        return;
++    }
++
++    uint8_t value = burstPhase < 18
++        ? static_cast<uint8_t>((255 * burstPhase) / 18)
++        : static_cast<uint8_t>(255 - ((155 * (burstPhase - 18)) / 70));
++    switch(burst)
++    {
++    case 0:
++        setColorScaled(255, 0, 0, value);
++        break;
++    case 1:
++        setColorScaled(255, 120, 0, value);
++        break;
++    case 2:
++        setColorScaled(0, 255, 0, value);
++        break;
++    case 3:
++        setColorScaled(0, 180, 255, value);
++        break;
++    case 4:
++        setColorScaled(80, 0, 255, value);
++        break;
++    default:
++        setColorScaled(255, 255, 255, value);
++        break;
++    }
++}
++
++void Ws2812StatusLed::renderElectricZap(int64_t now)
++{
++    uint16_t phase = static_cast<uint16_t>(now % 1000);
++    bool zap = phase < 35 ||
++               (phase >= 65 && phase < 95) ||
++               (phase >= 130 && phase < 190) ||
++               (phase >= 265 && phase < 295) ||
++               (phase >= 345 && phase < 390);
++
++    if(zap)
++    {
++        uint8_t value = static_cast<uint8_t>(170 + (hash8(static_cast<uint32_t>(now / 20)) % 86));
++        setColorScaled(120, 220, 255, value);
++    }
++    else if(phase < 450)
++    {
++        setColorScaled(0, 35, 80, 45);
++    }
++    else
++    {
++        setColor(0, 0, 0);
++    }
++}
++
++void Ws2812StatusLed::renderDoubleFlash(uint8_t red, uint8_t green, uint8_t blue, uint16_t cycleMs, int64_t now)
++{
++    uint16_t phase = static_cast<uint16_t>(now % cycleMs);
++    if(phase < 80 || (phase >= 150 && phase < 230))
++    {
++        setColor(red, green, blue);
++    }
++    else
++    {
++        setColor(0, 0, 0);
++    }
++}
++
++void Ws2812StatusLed::renderPoliceRedBlue(uint16_t cycleMs, int64_t now)
++{
++    uint16_t phase = static_cast<uint16_t>(now % cycleMs);
++    if(phase < 90 || (phase >= 150 && phase < 240))
++    {
++        setColor(255, 0, 0);
++    }
++    else if((phase >= 360 && phase < 450) || (phase >= 510 && phase < 600))
++    {
++        setColor(0, 0, 255);
++    }
++    else
++    {
++        setColor(0, 0, 0);
++    }
++}
++
++void Ws2812StatusLed::setColorScaled(uint8_t red, uint8_t green, uint8_t blue, uint8_t scale)
++{
++    setColor(static_cast<uint8_t>((static_cast<uint16_t>(red) * scale) / 255),
++             static_cast<uint8_t>((static_cast<uint16_t>(green) * scale) / 255),
++             static_cast<uint8_t>((static_cast<uint16_t>(blue) * scale) / 255));
++}
++
++void Ws2812StatusLed::setHsv(uint16_t hue, uint8_t saturation, uint8_t value)
++{
++    if(_strip == nullptr)
++    {
++        return;
++    }
++
++    led_strip_handle_t strip = static_cast<led_strip_handle_t>(_strip);
++    led_strip_set_pixel_hsv(strip, 0, hue % 360, saturation, scaleComponent(value, _brightness));
++    led_strip_refresh(strip);
++    _lastColor = 0xffffffff;
++}
++
++void Ws2812StatusLed::setColor(uint8_t red, uint8_t green, uint8_t blue)
++{
++    if(_strip == nullptr)
++    {
++        return;
++    }
++
++    uint8_t scaledRed = scaleComponent(red, _brightness);
++    uint8_t scaledGreen = scaleComponent(green, _brightness);
++    uint8_t scaledBlue = scaleComponent(blue, _brightness);
++    uint32_t color = (static_cast<uint32_t>(scaledRed) << 16) |
++                     (static_cast<uint32_t>(scaledGreen) << 8) |
++                     scaledBlue;
++
++    if(color == _lastColor)
++    {
++        return;
++    }
++
++    led_strip_handle_t strip = static_cast<led_strip_handle_t>(_strip);
++    led_strip_set_pixel(strip, 0, scaledRed, scaledGreen, scaledBlue);
++    led_strip_refresh(strip);
++    _lastColor = color;
++}
++
++uint16_t Ws2812StatusLed::momentaryDuration(Ws2812Trigger trigger, Ws2812Effect effect) const
++{
++    uint16_t duration = 0;
++
++    switch(effect)
++    {
++    case Ws2812Effect::Disabled:
++        duration = 0;
++        break;
++    case Ws2812Effect::Off:
++        duration = 250;
++        break;
++    case Ws2812Effect::FlashWhite:
++    case Ws2812Effect::FlashGreen:
++    case Ws2812Effect::FlashRed:
++    case Ws2812Effect::FlashBlue:
++    case Ws2812Effect::DoubleFlashWhite:
++    case Ws2812Effect::DoubleFlashRed:
++    case Ws2812Effect::PoliceRedBlue:
++        duration = 2500;
++        break;
++    case Ws2812Effect::PulseBlue:
++    case Ws2812Effect::PulseGreen:
++    case Ws2812Effect::PulseWhite:
++    case Ws2812Effect::PulseAmber:
++    case Ws2812Effect::BreathBlue:
++    case Ws2812Effect::BreathGreen:
++    case Ws2812Effect::BreathAmber:
++    case Ws2812Effect::BreathWhite:
++    case Ws2812Effect::HeartbeatWhite:
++    case Ws2812Effect::HeartbeatRed:
++    case Ws2812Effect::TwinkleWhite:
++    case Ws2812Effect::FireFlicker:
++        duration = 3000;
++        break;
++    case Ws2812Effect::PrismSprint:
++    case Ws2812Effect::RainbowBeat:
++    case Ws2812Effect::PartySparkle:
++    case Ws2812Effect::ColorBurst:
++    case Ws2812Effect::ElectricZap:
++        duration = 5000;
++        break;
++    case Ws2812Effect::BlinkWhite:
++        duration = 30000;
++        break;
++    case Ws2812Effect::LegacyRainbowFast:
++    case Ws2812Effect::Rainbow:
++        duration = RAINBOW_CYCLE_MS * 3;
++        break;
++    default:
++        duration = 1800;
++        break;
++    }
++
++    if(trigger == Ws2812Trigger::DoorbellRing && duration > 0 && duration < DOORBELL_MIN_DURATION_MS)
++    {
++        return DOORBELL_MIN_DURATION_MS;
++    }
++
++    return duration;
++}
++
++const char* Ws2812StatusLed::getTriggerDescription(Ws2812Trigger trigger)
++{
++    switch(trigger)
++    {
++    case Ws2812Trigger::Startup:
++        return "Startup";
++    case Ws2812Trigger::NetworkConnected:
++        return "Network connected";
++    case Ws2812Trigger::MqttConnected:
++        return "MQTT connected";
++    case Ws2812Trigger::BluetoothComm:
++        return "Bluetooth communication";
++    case Ws2812Trigger::BluetoothCommError:
++        return "Bluetooth communication error";
++    case Ws2812Trigger::LockLocked:
++        return "Lock locked";
++    case Ws2812Trigger::LockUnlocked:
++        return "Lock unlocked";
++    case Ws2812Trigger::LockMotorBlocked:
++        return "Lock motor blocked";
++    case Ws2812Trigger::RtoActive:
++        return "RTO active";
++    case Ws2812Trigger::CmActive:
++        return "Continuous mode active";
++    case Ws2812Trigger::RtoOrCmActive:
++        return "RTO or continuous mode active";
++    case Ws2812Trigger::DoorbellRing:
++        return "Doorbell ring";
++    case Ws2812Trigger::GeneralInput:
++        return "General GPIO input";
++    default:
++        return "Unknown";
++    }
++}
++
++const char* Ws2812StatusLed::getEffectDescription(Ws2812Effect effect)
++{
++    switch(effect)
++    {
++    case Ws2812Effect::Disabled:
++        return "Disabled";
++    case Ws2812Effect::Off:
++        return "Off";
++    case Ws2812Effect::SolidGreen:
++        return "Solid green";
++    case Ws2812Effect::SolidRed:
++        return "Solid red";
++    case Ws2812Effect::SolidBlue:
++        return "Solid blue";
++    case Ws2812Effect::SolidAmber:
++        return "Solid amber";
++    case Ws2812Effect::SolidWhite:
++        return "Solid white";
++    case Ws2812Effect::BlinkGreen:
++        return "Blink green";
++    case Ws2812Effect::BlinkRed:
++        return "Blink red";
++    case Ws2812Effect::BlinkBlue:
++        return "Blink blue";
++    case Ws2812Effect::BlinkAmber:
++        return "Blink amber";
++    case Ws2812Effect::FlashWhite:
++        return "Flash white";
++    case Ws2812Effect::FlashGreen:
++        return "Flash green";
++    case Ws2812Effect::FlashRed:
++        return "Flash red";
++    case Ws2812Effect::FlashBlue:
++        return "Flash blue";
++    case Ws2812Effect::PulseBlue:
++        return "Pulse blue";
++    case Ws2812Effect::PulseGreen:
++        return "Pulse green";
++    case Ws2812Effect::Rainbow:
++        return "Rainbow";
++    case Ws2812Effect::BlinkWhite:
++        return "Blink white";
++    case Ws2812Effect::PulseWhite:
++        return "Pulse white";
++    case Ws2812Effect::PulseAmber:
++        return "Pulse amber";
++    case Ws2812Effect::DoubleFlashWhite:
++        return "Double flash white";
++    case Ws2812Effect::DoubleFlashRed:
++        return "Double flash red";
++    case Ws2812Effect::PoliceRedBlue:
++        return "Police red/blue";
++    case Ws2812Effect::LegacyRainbowFast:
++        return "Rainbow";
++    case Ws2812Effect::BreathBlue:
++        return "Breath blue";
++    case Ws2812Effect::BreathGreen:
++        return "Breath green";
++    case Ws2812Effect::BreathAmber:
++        return "Breath amber";
++    case Ws2812Effect::BreathWhite:
++        return "Breath white";
++    case Ws2812Effect::HeartbeatWhite:
++        return "Heartbeat white";
++    case Ws2812Effect::HeartbeatRed:
++        return "Heartbeat red";
++    case Ws2812Effect::TwinkleWhite:
++        return "Twinkle white";
++    case Ws2812Effect::FireFlicker:
++        return "Fire flicker";
++    case Ws2812Effect::PrismSprint:
++        return "Prism sprint";
++    case Ws2812Effect::RainbowBeat:
++        return "Rainbow beat";
++    case Ws2812Effect::PartySparkle:
++        return "Party sparkle";
++    case Ws2812Effect::ColorBurst:
++        return "Color burst";
++    case Ws2812Effect::ElectricZap:
++        return "Electric zap";
++    default:
++        return "Unknown";
++    }
++}
++
++Ws2812Effect Ws2812StatusLed::defaultEffectForTrigger(Ws2812Trigger trigger)
++{
++    switch(trigger)
++    {
++    case Ws2812Trigger::Startup:
++        return Ws2812Effect::FlashGreen;
++    case Ws2812Trigger::BluetoothComm:
++        return Ws2812Effect::PulseBlue;
++    case Ws2812Trigger::BluetoothCommError:
++    case Ws2812Trigger::LockMotorBlocked:
++        return Ws2812Effect::FlashRed;
++    case Ws2812Trigger::DoorbellRing:
++        return Ws2812Effect::DoubleFlashWhite;
++    case Ws2812Trigger::GeneralInput:
++        return Ws2812Effect::FlashBlue;
++    default:
++        return Ws2812Effect::Disabled;
++    }
++}
++
++void Ws2812StatusLed::loadEffects(Preferences* preferences, Ws2812Effect effects[WS2812_TRIGGER_COUNT])
++{
++    for(uint8_t i = 0; i < WS2812_TRIGGER_COUNT; i++)
++    {
++        effects[i] = defaultEffectForTrigger(static_cast<Ws2812Trigger>(i));
++    }
++
++    size_t storedLength = preferences->getBytesLength(preference_ws2812_effects);
++    if(storedLength == 0)
++    {
++        return;
++    }
++
++    uint8_t serialized[WS2812_TRIGGER_COUNT] = {};
++    size_t size = preferences->getBytes(preference_ws2812_effects, serialized, sizeof(serialized));
++    for(uint8_t i = 0; i < size && i < WS2812_TRIGGER_COUNT; i++)
++    {
++        if(serialized[i] == LEGACY_RAINBOW_FAST_EFFECT)
++        {
++            effects[i] = Ws2812Effect::Rainbow;
++        }
++        else if(serialized[i] < WS2812_EFFECT_COUNT)
++        {
++            effects[i] = static_cast<Ws2812Effect>(serialized[i]);
++        }
++    }
++}
++
++void Ws2812StatusLed::saveEffects(Preferences* preferences, const Ws2812Effect effects[WS2812_TRIGGER_COUNT])
++{
++    uint8_t serialized[WS2812_TRIGGER_COUNT] = {};
++    for(uint8_t i = 0; i < WS2812_TRIGGER_COUNT; i++)
++    {
++        serialized[i] = static_cast<uint8_t>(effects[i]);
++    }
++
++    preferences->putBytes(preference_ws2812_effects, serialized, sizeof(serialized));
++}
++
++void Ws2812StatusLed::loadBrightnesses(Preferences* preferences, uint8_t brightnesses[WS2812_TRIGGER_COUNT], uint8_t defaultBrightness)
++{
++    uint8_t normalizedDefault = clampBrightness(defaultBrightness);
++    for(uint8_t i = 0; i < WS2812_TRIGGER_COUNT; i++)
++    {
++        brightnesses[i] = normalizedDefault;
++    }
++
++    size_t storedLength = preferences->getBytesLength(preference_ws2812_brightnesses);
++    if(storedLength == 0)
++    {
++        return;
++    }
++
++    uint8_t serialized[WS2812_TRIGGER_COUNT] = {};
++    size_t size = preferences->getBytes(preference_ws2812_brightnesses, serialized, sizeof(serialized));
++    for(uint8_t i = 0; i < size && i < WS2812_TRIGGER_COUNT; i++)
++    {
++        if(serialized[i] > 0)
++        {
++            brightnesses[i] = serialized[i];
++        }
++    }
++}
++
++void Ws2812StatusLed::saveBrightnesses(Preferences* preferences, const uint8_t brightnesses[WS2812_TRIGGER_COUNT])
++{
++    uint8_t serialized[WS2812_TRIGGER_COUNT] = {};
++    for(uint8_t i = 0; i < WS2812_TRIGGER_COUNT; i++)
++    {
++        serialized[i] = clampBrightness(brightnesses[i]);
++    }
++
++    preferences->putBytes(preference_ws2812_brightnesses, serialized, sizeof(serialized));
++}
