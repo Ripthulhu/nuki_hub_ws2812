@@ -1,0 +1,81 @@
+name: WS2812 ESP32-S3 Octal Build
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - ws2812-status-led
+      - ws2812-*
+  pull_request:
+    branches:
+      - master
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build esp32-s3-oct
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Check out sources
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Apply WS2812 patch
+        run: git apply patches/ws2812-status-led/*.patch
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache PlatformIO
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/pip
+            ~/.platformio/.cache
+            ~/.platformio/packages
+          key: ${{ runner.os }}-pio-s3-oct-${{ hashFiles('platformio.ini', 'src/idf_component.yml', 'updater/src/idf_component.yml') }}
+          restore-keys: |
+            ${{ runner.os }}-pio-s3-oct-
+
+      - name: Install dependencies
+        run: make deps
+
+      - name: Add CI build version
+        env:
+          Version: ${{ github.run_id }}.${{ github.run_number }}.${{ github.run_attempt }}
+        run: sed -i "s/unknownbuildnr/$Version/g" src/Config.h
+
+      - name: Build updater
+        run: make updater_esp32-s3-oct
+
+      - name: Build firmware
+        run: make esp32-s3-oct
+
+      - name: Check OTA image size
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          slot_size = 0x260000
+          artifact = Path("release/esp32s3oct/nuki_hub_esp32s3oct.bin")
+          size = artifact.stat().st_size
+          margin = slot_size - size
+          print(f"{artifact}: {size} bytes")
+          print(f"OTA slot budget: {slot_size} bytes")
+          print(f"Margin: {margin} bytes")
+          if size > slot_size:
+              raise SystemExit("Firmware exceeds the esp32-s3-oct OTA slot budget")
+          PY
+
+      - name: Upload esp32-s3-oct artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: nuki-hub-ws2812-esp32s3oct
+          path: release/esp32s3oct
