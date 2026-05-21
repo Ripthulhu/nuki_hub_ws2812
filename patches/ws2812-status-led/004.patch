@@ -1,0 +1,241 @@
+diff --git a/src/Ws2812StatusLed.h b/src/Ws2812StatusLed.h
+new file mode 100644
+index 0000000..7a0899c
+--- /dev/null
++++ b/src/Ws2812StatusLed.h
+@@ -0,0 +1,143 @@
++#pragma once
++
++#include <Preferences.h>
++#include <cstdint>
++
++enum class Ws2812Trigger : uint8_t
++{
++    Startup,
++    NetworkConnected,
++    MqttConnected,
++    BluetoothComm,
++    BluetoothCommError,
++    LockLocked,
++    LockUnlocked,
++    LockMotorBlocked,
++    RtoActive,
++    CmActive,
++    RtoOrCmActive,
++    DoorbellRing,
++    GeneralInput,
++    Count
++};
++
++enum class Ws2812Effect : uint8_t
++{
++    Disabled,
++    Off,
++    SolidGreen,
++    SolidRed,
++    SolidBlue,
++    SolidAmber,
++    SolidWhite,
++    BlinkGreen,
++    BlinkRed,
++    BlinkBlue,
++    BlinkAmber,
++    FlashWhite,
++    FlashGreen,
++    FlashRed,
++    FlashBlue,
++    PulseBlue,
++    PulseGreen,
++    Rainbow,
++    BlinkWhite,
++    PulseWhite,
++    PulseAmber,
++    DoubleFlashWhite,
++    DoubleFlashRed,
++    PoliceRedBlue,
++    LegacyRainbowFast,
++    BreathBlue,
++    BreathGreen,
++    BreathAmber,
++    BreathWhite,
++    HeartbeatWhite,
++    HeartbeatRed,
++    TwinkleWhite,
++    FireFlicker,
++    PrismSprint,
++    RainbowBeat,
++    PartySparkle,
++    ColorBurst,
++    ElectricZap,
++    Count
++};
++
++constexpr uint8_t WS2812_TRIGGER_COUNT = static_cast<uint8_t>(Ws2812Trigger::Count);
++constexpr uint8_t WS2812_EFFECT_COUNT = static_cast<uint8_t>(Ws2812Effect::Count);
++
++class Ws2812StatusLed
++{
++public:
++    explicit Ws2812StatusLed(Preferences* preferences);
++    ~Ws2812StatusLed();
++
++    void begin();
++    void reload();
++    void update();
++    void test();
++
++    void trigger(Ws2812Trigger trigger);
++    void setTriggerState(Ws2812Trigger trigger, bool active);
++
++    bool enabled() const;
++    int pin() const;
++    uint8_t brightness() const;
++
++    Ws2812Effect effectForTrigger(Ws2812Trigger trigger) const;
++
++    static const char* getTriggerDescription(Ws2812Trigger trigger);
++    static const char* getEffectDescription(Ws2812Effect effect);
++    static Ws2812Effect defaultEffectForTrigger(Ws2812Trigger trigger);
++    static void loadEffects(Preferences* preferences, Ws2812Effect effects[WS2812_TRIGGER_COUNT]);
++    static void saveEffects(Preferences* preferences, const Ws2812Effect effects[WS2812_TRIGGER_COUNT]);
++    static void loadBrightnesses(Preferences* preferences, uint8_t brightnesses[WS2812_TRIGGER_COUNT], uint8_t defaultBrightness = 32);
++    static void saveBrightnesses(Preferences* preferences, const uint8_t brightnesses[WS2812_TRIGGER_COUNT]);
++
++private:
++    void loadSettings();
++    bool configureStrip();
++    void deleteStrip();
++    void clear();
++    void render(Ws2812Effect effect, int64_t now);
++    void renderBlink(uint8_t red, uint8_t green, uint8_t blue, uint16_t periodMs, int64_t now);
++    void renderShortBlink(uint8_t red, uint8_t green, uint8_t blue, uint16_t intervalMs, uint16_t onMs, int64_t now);
++    void renderPulse(uint8_t red, uint8_t green, uint8_t blue, uint16_t periodMs, int64_t now);
++    void renderBreath(uint8_t red, uint8_t green, uint8_t blue, uint16_t periodMs, int64_t now);
++    void renderHeartbeat(uint8_t red, uint8_t green, uint8_t blue, uint16_t periodMs, int64_t now);
++    void renderTwinkle(uint8_t red, uint8_t green, uint8_t blue, uint16_t periodMs, int64_t now);
++    void renderFireFlicker(int64_t now);
++    void renderPrismSprint(int64_t now);
++    void renderRainbowBeat(int64_t now);
++    void renderPartySparkle(int64_t now);
++    void renderColorBurst(int64_t now);
++    void renderElectricZap(int64_t now);
++    void renderDoubleFlash(uint8_t red, uint8_t green, uint8_t blue, uint16_t cycleMs, int64_t now);
++    void renderPoliceRedBlue(uint16_t cycleMs, int64_t now);
++    void setHsv(uint16_t hue, uint8_t saturation, uint8_t value);
++    void setColor(uint8_t red, uint8_t green, uint8_t blue);
++    void setColorScaled(uint8_t red, uint8_t green, uint8_t blue, uint8_t scale);
++    Ws2812Effect currentEffect(int64_t now, uint8_t& brightness);
++    uint16_t momentaryDuration(Ws2812Trigger trigger, Ws2812Effect effect) const;
++
++    Preferences* _preferences = nullptr;
++    void* _updateMutex = nullptr;
++    void* _strip = nullptr;
++    int _pin = -1;
++    int _activePin = -1;
++    uint8_t _defaultBrightness = 32;
++    uint8_t _brightness = 32;
++    Ws2812Effect _effects[WS2812_TRIGGER_COUNT] = {};
++    uint8_t _triggerBrightness[WS2812_TRIGGER_COUNT] = {};
++    bool _activeTriggers[WS2812_TRIGGER_COUNT] = {};
++    Ws2812Effect _momentaryEffect = Ws2812Effect::Disabled;
++    uint8_t _momentaryBrightness = 32;
++    int64_t _momentaryStartedAt = 0;
++    int64_t _momentaryUntil = 0;
++    bool _shortBlinkActive = false;
++    int64_t _shortBlinkNextAt = 0;
++    int64_t _shortBlinkOffAt = 0;
++    int64_t _lastRefresh = 0;
++    uint32_t _lastColor = 0xffffffff;
++};
+diff --git a/src/idf_component.yml b/src/idf_component.yml
+index 6f7ae48..afd86d2 100644
+--- a/src/idf_component.yml
++++ b/src/idf_component.yml
+@@ -7,6 +7,7 @@ dependencies:
+     version: 25af28bcad1d3c42f76bfc6e73bea3f833a4ef6d
+     
+   espressif/libsodium: "^1.0.20~2"
++  espressif/led_strip: "^3.0.3"
+ 
+   espressif/esp_hosted:
+     version: "*"
+diff --git a/src/main.cpp b/src/main.cpp
+index 470db66..a6a1b4d 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -715,7 +715,7 @@ void startNuki(bool lock)
+     }
+     else
+     {
+-        networkOpener = new NukiNetworkOpener(network, preferences, CharBuffer::get(), buffer_size);
++        networkOpener = new NukiNetworkOpener(network, preferences, gpio, CharBuffer::get(), buffer_size);
+ 
+         if(!disableNetwork)
+         {
+@@ -926,6 +926,12 @@ void networkTask(void *pvParameters)
+         }
+ #endif
+         network->update();
++#ifndef NUKI_HUB_UPDATER
++        if(gpio != nullptr)
++        {
++            gpio->update();
++        }
++#endif
+         if (esp_task_wdt_status(NULL) == ESP_OK)
+         {
+             esp_task_wdt_reset();
+@@ -1136,6 +1142,11 @@ void nukiTask(void *pvParameters)
+     bool whiteListed = false;
+     while(true)
+     {
++        if(disableNetwork && gpio != nullptr)
++        {
++            gpio->update();
++        }
++
+         if((disableNetwork || wifiConnected) && bleDone)
+         {
+             if(bleScannerStarted)
+diff --git a/src/util/NukiRetryHandler.cpp b/src/util/NukiRetryHandler.cpp
+index c23115e..221905b 100644
+--- a/src/util/NukiRetryHandler.cpp
++++ b/src/util/NukiRetryHandler.cpp
+@@ -1,4 +1,5 @@
+ #include "NukiRetryHandler.h"
++#include "Arduino.h"
+ #include "Logger.h"
+ 
+ NukiRetryHandler::NukiRetryHandler(std::string reference, Gpio* gpio, std::vector<uint8_t> pinsComm, std::vector<uint8_t> pinsCommError, int nrOfRetries, int retryDelay)
+@@ -52,6 +53,7 @@ const Nuki::CmdResult NukiRetryHandler::retryComm(std::function<Nuki::CmdResult(
+ 
+ void NukiRetryHandler::setCommPins(const uint8_t& value)
+ {
++    _gpio->setWs2812TriggerState(Ws2812Trigger::BluetoothComm, value == HIGH);
+     for (uint8_t pin : _pinsComm)
+     {
+         _gpio->setPinOutput(pin, value);
+@@ -60,10 +62,9 @@ void NukiRetryHandler::setCommPins(const uint8_t& value)
+ 
+ void NukiRetryHandler::setCommErrorPins(const uint8_t& value)
+ {
++    _gpio->setWs2812TriggerState(Ws2812Trigger::BluetoothCommError, value == HIGH);
+     for (uint8_t pin : _pinsCommError)
+     {
+         _gpio->setPinOutput(pin, value);
+     }
+ }
+-
+-
+diff --git a/src/util/NukiRetryHandler.h b/src/util/NukiRetryHandler.h
+index 046bd12..304c7a0 100644
+--- a/src/util/NukiRetryHandler.h
++++ b/src/util/NukiRetryHandler.h
+@@ -2,6 +2,7 @@
+ #include <functional>
+ #include "NukiDataTypes.h"
+ #include "NukiPublisher.h"
++#include "Gpio.h"
+ 
+ class NukiRetryHandler
+ {
