@@ -1,0 +1,296 @@
+diff --git a/src/NukiOpenerWrapper.cpp b/src/NukiOpenerWrapper.cpp
+index 6f3a410..ebd3060 100644
+--- a/src/NukiOpenerWrapper.cpp
++++ b/src/NukiOpenerWrapper.cpp
+@@ -546,6 +546,7 @@ bool NukiOpenerWrapper::updateKeyTurnerState()
+             _lastKeyTurnerState.lockState != NukiOpener::LockState::Opening)
+     {
+         Log->println("Nuki opener: Ring detected (CM)");
++        _gpio->triggerWs2812(Ws2812Trigger::DoorbellRing);
+         _network->publishRing(false);
+     }
+     else if((!isPinValid() || !_publishAuthData) &&
+@@ -556,6 +557,7 @@ bool NukiOpenerWrapper::updateKeyTurnerState()
+             _lastKeyTurnerState.lockState == NukiOpener::LockState::RTOactive)
+     {
+         Log->println("Nuki opener: Ring detected (RTO)");
++        _gpio->triggerWs2812(Ws2812Trigger::DoorbellRing);
+         _network->publishRing(false);
+     }
+     else if((!isPinValid() || !_publishAuthData) &&
+@@ -565,6 +567,7 @@ bool NukiOpenerWrapper::updateKeyTurnerState()
+             _lastKeyTurnerState.nukiState == _keyTurnerState.nukiState)
+     {
+         Log->println("Nuki opener: Ring detected");
++        _gpio->triggerWs2812(Ws2812Trigger::DoorbellRing);
+         _network->publishRing(true);
+     }
+     else
+@@ -3677,6 +3680,10 @@ void NukiOpenerWrapper::updateGpioOutputs()
+     bool rtoActive = _keyTurnerState.lockState == LockState::RTOactive;
+     bool cmActive = _keyTurnerState.nukiState == State::ContinuousMode;
+ 
++    _gpio->setWs2812TriggerState(Ws2812Trigger::RtoActive, rtoActive);
++    _gpio->setWs2812TriggerState(Ws2812Trigger::CmActive, cmActive);
++    _gpio->setWs2812TriggerState(Ws2812Trigger::RtoOrCmActive, rtoActive || cmActive);
++
+     for(const auto& entry : pinConfiguration)
+     {
+         switch(entry.role)
+diff --git a/src/NukiWrapper.cpp b/src/NukiWrapper.cpp
+index c7d039d..121a0ca 100644
+--- a/src/NukiWrapper.cpp
++++ b/src/NukiWrapper.cpp
+@@ -4067,19 +4067,25 @@ void NukiWrapper::updateGpioOutputs()
+     const auto& pinConfiguration = _gpio->pinConfiguration();
+ 
+     const LockState& lockState = _keyTurnerState.lockState;
++    bool locked = lockState == LockState::Locked || lockState == LockState::Locking;
++    bool motorBlocked = lockState == LockState::MotorBlocked;
++
++    _gpio->setWs2812TriggerState(Ws2812Trigger::LockLocked, locked);
++    _gpio->setWs2812TriggerState(Ws2812Trigger::LockUnlocked, !locked);
++    _gpio->setWs2812TriggerState(Ws2812Trigger::LockMotorBlocked, motorBlocked);
+ 
+     for(const auto& entry : pinConfiguration)
+     {
+         switch(entry.role)
+         {
+         case PinRole::OutputHighLocked:
+-            _gpio->setPinOutput(entry.pin, lockState == LockState::Locked || lockState == LockState::Locking ? HIGH : LOW);
++            _gpio->setPinOutput(entry.pin, locked ? HIGH : LOW);
+             break;
+         case PinRole::OutputHighUnlocked:
+-            _gpio->setPinOutput(entry.pin, lockState == LockState::Locked || lockState == LockState::Locking ? LOW : HIGH);
++            _gpio->setPinOutput(entry.pin, locked ? LOW : HIGH);
+             break;
+         case PinRole::OutputHighMotorBlocked:
+-            _gpio->setPinOutput(entry.pin, lockState == LockState::MotorBlocked  ? HIGH : LOW);
++            _gpio->setPinOutput(entry.pin, motorBlocked ? HIGH : LOW);
+             break;
+         }
+     }
+@@ -4116,4 +4122,4 @@ void NukiWrapper::updateTime()
+     {
+         return _nukiLock.updateTime(nukiTime);
+     });
+-}
+\ No newline at end of file
++}
+diff --git a/src/PreferencesKeys.h b/src/PreferencesKeys.h
+index 78984ca..4db7da9 100644
+--- a/src/PreferencesKeys.h
++++ b/src/PreferencesKeys.h
+@@ -40,6 +40,10 @@
+ //MQTT RELATED
+ #define preference_mqtt_log_enabled (char*)"mqttlog"
+ #define preference_gpio_configuration (char*)"gpiocfg"
++#define preference_ws2812_gpio (char*)"ws2812gpio"
++#define preference_ws2812_brightness (char*)"ws2812br"
++#define preference_ws2812_effects (char*)"ws2812fx"
++#define preference_ws2812_brightnesses (char*)"ws2812brs"
+ 
+ //TASKS RELATED
+ #define preference_task_size_network (char*)"tsksznetw"
+@@ -266,6 +270,8 @@ inline void initPreferences(Preferences* preferences)
+         preferences->putBool(preference_config_from_mqtt, false);
+         preferences->putBool(preference_force_hosted_update, false);
+ 
++        preferences->putInt(preference_ws2812_gpio, -1);
++        preferences->putInt(preference_ws2812_brightness, 32);
+         preferences->putInt(preference_mqtt_broker_port, 1883);
+         preferences->putInt(preference_buffer_size, CHAR_BUFFER_SIZE);
+         preferences->putInt(preference_task_size_network, NETWORK_TASK_SIZE);
+@@ -548,6 +554,7 @@ private:
+     {
+         preference_started_before, preference_config_version, preference_device_id_lock, preference_device_id_opener, preference_nuki_id_lock, preference_nuki_id_opener,
+         preference_mqtt_broker, preference_mqtt_broker_port, preference_mqtt_user, preference_mqtt_password, preference_mqtt_log_enabled, preference_check_updates,
++        preference_ws2812_gpio, preference_ws2812_brightness,
+         preference_webserver_enabled, preference_lock_enabled, preference_lock_pin_status, preference_mqtt_lock_path, preference_opener_enabled, preference_opener_pin_status,
+         preference_opener_continuous_mode, preference_lock_max_keypad_code_count, preference_opener_max_keypad_code_count, preference_update_time, preference_time_server,
+         preference_lock_max_timecontrol_entry_count, preference_opener_max_timecontrol_entry_count, preference_enable_bootloop_reset,
+@@ -599,7 +606,7 @@ private:
+     std::vector<char*> _bytePrefs =
+     {
+         preference_acl, preference_conf_lock_basic_acl, preference_conf_lock_advanced_acl, preference_conf_opener_basic_acl,
+-        preference_conf_opener_advanced_acl, preference_gpio_configuration
++        preference_conf_opener_advanced_acl, preference_gpio_configuration, preference_ws2812_effects, preference_ws2812_brightnesses
+     };
+     std::vector<char*> _intPrefs =
+     {
+@@ -609,6 +616,7 @@ private:
+         preference_rssi_publish_interval, preference_network_timeout, preference_restart_ble_beacon_lost, preference_query_interval_lockstate,
+         preference_query_interval_configuration, preference_query_interval_battery, preference_query_interval_keypad, preference_command_nr_of_retries,
+         preference_task_size_network, preference_task_size_nuki, preference_authlog_max_entries, preference_keypad_max_entries, preference_timecontrol_max_entries,
++        preference_ws2812_gpio, preference_ws2812_brightness,
+         preference_ble_tx_power, preference_network_custom_mdc, preference_network_custom_clk, preference_network_custom_phy, preference_network_custom_addr,
+         preference_network_custom_irq, preference_network_custom_rst, preference_network_custom_cs, preference_network_custom_sck, preference_network_custom_miso,
+         preference_network_custom_mosi, preference_network_custom_pwr, preference_network_custom_mdio, preference_http_auth_type,
+@@ -653,4 +661,4 @@ public:
+     {
+         return _uint64Prefs;
+     }
+-};
+\ No newline at end of file
++};
+diff --git a/src/WebCfgServer.cpp b/src/WebCfgServer.cpp
+index 44aab0a..fb12642 100644
+--- a/src/WebCfgServer.cpp
++++ b/src/WebCfgServer.cpp
+@@ -5130,6 +5130,13 @@ void WebCfgServer::processGpioArgs(PsychicRequest *request, PsychicResponse* res
+ {
+     int params = request->params();
+     std::vector<PinEntry> pinConfiguration;
++    int ws2812Pin = -1;
++    int ws2812Brightness = _preferences->getInt(preference_ws2812_brightness, 32);
++    bool testWs2812 = false;
++    Ws2812Effect ws2812Effects[WS2812_TRIGGER_COUNT];
++    uint8_t ws2812Brightnesses[WS2812_TRIGGER_COUNT];
++    Ws2812StatusLed::loadEffects(_preferences, ws2812Effects);
++    Ws2812StatusLed::loadBrightnesses(_preferences, ws2812Brightnesses, ws2812Brightness);
+ 
+     for(int index = 0; index < params; index++)
+     {
+@@ -5142,10 +5149,60 @@ void WebCfgServer::processGpioArgs(PsychicRequest *request, PsychicResponse* res
+                 _preferences->putBool(preference_retain_gpio, (p->value() == "1"));
+             }
+         }
++        else if(p->name() == "WSBRIGHT")
++        {
++            ws2812Brightness = p->value().toInt();
++            if(ws2812Brightness < 1)
++            {
++                ws2812Brightness = 1;
++            }
++            else if(ws2812Brightness > 255)
++            {
++                ws2812Brightness = 255;
++            }
++        }
++        else if(p->name().startsWith("WSBR"))
++        {
++            int trigger = p->name().substring(4).toInt();
++            int brightness = p->value().toInt();
++            if(brightness < 1)
++            {
++                brightness = 1;
++            }
++            else if(brightness > 255)
++            {
++                brightness = 255;
++            }
++            if(trigger >= 0 && trigger < WS2812_TRIGGER_COUNT)
++            {
++                ws2812Brightnesses[trigger] = static_cast<uint8_t>(brightness);
++            }
++        }
++        else if(p->name().startsWith("WSFX"))
++        {
++            int trigger = p->name().substring(4).toInt();
++            int effect = p->value().toInt();
++            if(trigger >= 0 && trigger < WS2812_TRIGGER_COUNT && effect >= 0 && effect < WS2812_EFFECT_COUNT)
++            {
++                ws2812Effects[trigger] = static_cast<Ws2812Effect>(effect);
++            }
++        }
++        else if(p->name() == "WSTEST")
++        {
++            testWs2812 = true;
++        }
+         else
+         {
+             PinRole role = (PinRole)p->value().toInt();
+-            if(role != PinRole::Disabled)
++            if(role == PinRole::Ws2812Data)
++            {
++                ws2812Pin = p->name().toInt();
++                PinEntry entry;
++                entry.pin = ws2812Pin;
++                entry.role = role;
++                pinConfiguration.push_back(entry);
++            }
++            else if(role != PinRole::Disabled)
+             {
+                 PinEntry entry;
+                 entry.pin = p->name().toInt();
+@@ -5155,7 +5212,15 @@ void WebCfgServer::processGpioArgs(PsychicRequest *request, PsychicResponse* res
+         }
+     }
+ 
++    _preferences->putInt(preference_ws2812_gpio, ws2812Pin);
++    _preferences->putInt(preference_ws2812_brightness, ws2812Brightness);
++    Ws2812StatusLed::saveEffects(_preferences, ws2812Effects);
++    Ws2812StatusLed::saveBrightnesses(_preferences, ws2812Brightnesses);
+     _gpio->savePinConfiguration(pinConfiguration);
++    if(testWs2812)
++    {
++        _gpio->testWs2812();
++    }
+ }
+ 
+ esp_err_t WebCfgServer::buildImportExportHtml(PsychicRequest *request, PsychicResponse* resp)
+@@ -6194,6 +6259,7 @@ esp_err_t WebCfgServer::buildNukiConfigHtml(PsychicRequest *request, PsychicResp
+     printInputField(&response, "TIMESRV", "NTP server", _preferences->getString(preference_time_server, "pool.ntp.org").c_str(), 255, "");
+ 
+     response.print("</table>");
++
+     response.print("<br><input type=\"submit\" name=\"submit\" value=\"Save\">");
+     response.print("</form>");
+     response.print("</body></html>");
+@@ -6233,7 +6299,44 @@ esp_err_t WebCfgServer::buildGpioConfigHtml(PsychicRequest *request, PsychicResp
+     }
+ 
+     response.print("</table>");
++
++    std::vector<std::pair<String, String>> ws2812EffectOptions;
++    for(uint8_t effect = 0; effect < WS2812_EFFECT_COUNT; effect++)
++    {
++        Ws2812Effect wsEffect = static_cast<Ws2812Effect>(effect);
++        if(wsEffect == Ws2812Effect::LegacyRainbowFast)
++        {
++            continue;
++        }
++        ws2812EffectOptions.push_back(std::make_pair(String((int)effect), Ws2812StatusLed::getEffectDescription(wsEffect)));
++    }
++
++    Ws2812Effect ws2812Effects[WS2812_TRIGGER_COUNT];
++    uint8_t ws2812Brightnesses[WS2812_TRIGGER_COUNT];
++    Ws2812StatusLed::loadEffects(_preferences, ws2812Effects);
++    Ws2812StatusLed::loadBrightnesses(_preferences, ws2812Brightnesses, _preferences->getInt(preference_ws2812_brightness, 32));
++
++    response.print("<h3>WS2812/NeoPixel Effects</h3>");
++    response.print("<table>");
++    for(uint8_t trigger = 0; trigger < WS2812_TRIGGER_COUNT; trigger++)
++    {
++        String triggerDescription = Ws2812StatusLed::getTriggerDescription(static_cast<Ws2812Trigger>(trigger));
++        String effectToken = "WSFX" + String(trigger);
++        String effectLabel = triggerDescription + " effect";
++        printDropDown(&response,
++                      effectToken.c_str(),
++                      effectLabel.c_str(),
++                      String((int)static_cast<uint8_t>(ws2812Effects[trigger])),
++                      ws2812EffectOptions,
++                      "");
++        String brightnessToken = "WSBR" + String(trigger);
++        String brightnessLabel = triggerDescription + " brightness (1-255)";
++        printInputField(&response, brightnessToken.c_str(), brightnessLabel.c_str(), ws2812Brightnesses[trigger], 3, "");
++    }
++    response.print("</table>");
++
+     response.print("<br><input type=\"submit\" name=\"submit\" value=\"Save\">");
++    response.print(" <input type=\"submit\" name=\"WSTEST\" value=\"Save and test WS2812/NeoPixel\">");
+     response.print("</form>");
+ 
+     options = getGpioOptions();
+@@ -7434,6 +7537,11 @@ const std::vector<std::pair<String, String>> WebCfgServer::getGpioOptions() cons
+ 
+ const String WebCfgServer::getPreselectionForGpio(const uint8_t &pin) const
+ {
++    if(_preferences->getInt(preference_ws2812_gpio, -1) == pin)
++    {
++        return String((int8_t)PinRole::Ws2812Data);
++    }
++
+     const std::vector<PinEntry>& pinConfiguration = _gpio->pinConfiguration();
+ 
+     for(const auto& entry : pinConfiguration)
