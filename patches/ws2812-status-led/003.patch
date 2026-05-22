@@ -1,9 +1,9 @@
 diff --git a/src/Ws2812StatusLed.cpp b/src/Ws2812StatusLed.cpp
 new file mode 100644
-index 0000000..bfe4f16
+index 0000000..b379686
 --- /dev/null
 +++ b/src/Ws2812StatusLed.cpp
-@@ -0,0 +1,1094 @@
+@@ -0,0 +1,1159 @@
 +#include "Ws2812StatusLed.h"
 +
 +#include "EspMillis.h"
@@ -281,9 +281,10 @@ index 0000000..bfe4f16
 +    _lastRefresh = now;
 +
 +    uint8_t brightness = _defaultBrightness;
-+    Ws2812Effect effect = currentEffect(now, brightness);
++    int64_t startedAt = now;
++    Ws2812Effect effect = currentEffect(now, brightness, startedAt);
 +    _brightness = brightness;
-+    render(effect, now);
++    render(effect, now, startedAt);
 +}
 +
 +void Ws2812StatusLed::test()
@@ -354,7 +355,17 @@ index 0000000..bfe4f16
 +        return;
 +    }
 +
-+    _activeTriggers[static_cast<uint8_t>(trigger)] = active;
++    uint8_t index = static_cast<uint8_t>(trigger);
++    if(active && !_activeTriggers[index])
++    {
++        _activeTriggerStartedAt[index] = espMillis();
++    }
++    else if(!active)
++    {
++        _activeTriggerStartedAt[index] = 0;
++    }
++
++    _activeTriggers[index] = active;
 +}
 +
 +bool Ws2812StatusLed::enabled() const
@@ -382,14 +393,16 @@ index 0000000..bfe4f16
 +    return _effects[static_cast<uint8_t>(trigger)];
 +}
 +
-+Ws2812Effect Ws2812StatusLed::currentEffect(int64_t now, uint8_t& brightness)
++Ws2812Effect Ws2812StatusLed::currentEffect(int64_t now, uint8_t& brightness, int64_t& startedAt)
 +{
 +    brightness = _defaultBrightness;
++    startedAt = now;
 +    if(_momentaryEffect != Ws2812Effect::Disabled)
 +    {
 +        if(now < _momentaryUntil)
 +        {
 +            brightness = _momentaryBrightness;
++            startedAt = _momentaryStartedAt;
 +            return _momentaryEffect;
 +        }
 +        _momentaryEffect = Ws2812Effect::Disabled;
@@ -404,6 +417,7 @@ index 0000000..bfe4f16
 +        if(_activeTriggers[index] && _effects[index] != Ws2812Effect::Disabled)
 +        {
 +            brightness = _triggerBrightness[index];
++            startedAt = _activeTriggerStartedAt[index] > 0 ? _activeTriggerStartedAt[index] : now;
 +            return _effects[index];
 +        }
 +    }
@@ -411,7 +425,7 @@ index 0000000..bfe4f16
 +    return Ws2812Effect::Disabled;
 +}
 +
-+void Ws2812StatusLed::render(Ws2812Effect effect, int64_t now)
++void Ws2812StatusLed::render(Ws2812Effect effect, int64_t now, int64_t startedAt)
 +{
 +    if(effect != Ws2812Effect::BlinkWhite)
 +    {
@@ -499,7 +513,7 @@ index 0000000..bfe4f16
 +        renderPoliceRedBlue(720, now);
 +        break;
 +    case Ws2812Effect::LegacyRainbowFast:
-+        render(Ws2812Effect::Rainbow, now);
++        render(Ws2812Effect::Rainbow, now, startedAt);
 +        break;
 +    case Ws2812Effect::BreathBlue:
 +        renderBreath(0, 0, 255, 1600, now);
@@ -539,6 +553,21 @@ index 0000000..bfe4f16
 +        break;
 +    case Ws2812Effect::ElectricZap:
 +        renderElectricZap(now);
++        break;
++    case Ws2812Effect::BreathSolidGreen:
++        renderBreathThenSolid(0, 255, 0, 450, 3, now, startedAt);
++        break;
++    case Ws2812Effect::BreathSolidRed:
++        renderBreathThenSolid(255, 0, 0, 450, 3, now, startedAt);
++        break;
++    case Ws2812Effect::BreathSolidBlue:
++        renderBreathThenSolid(0, 0, 255, 450, 3, now, startedAt);
++        break;
++    case Ws2812Effect::BreathSolidAmber:
++        renderBreathThenSolid(255, 120, 0, 450, 3, now, startedAt);
++        break;
++    case Ws2812Effect::BreathSolidWhite:
++        renderBreathThenSolid(255, 255, 255, 450, 3, now, startedAt);
 +        break;
 +    default:
 +        setColor(0, 0, 0);
@@ -599,6 +628,27 @@ index 0000000..bfe4f16
 +void Ws2812StatusLed::renderBreath(uint8_t red, uint8_t green, uint8_t blue, uint16_t periodMs, int64_t now)
 +{
 +    uint16_t phase = static_cast<uint16_t>(now % periodMs);
++    uint8_t eased = ease8InOutQuad(triangle8(phase, periodMs));
++    uint8_t scale = static_cast<uint8_t>(8 + scale8(eased, 247));
++    setColorScaled(red, green, blue, scale);
++}
++
++void Ws2812StatusLed::renderBreathThenSolid(uint8_t red, uint8_t green, uint8_t blue, uint16_t periodMs, uint8_t cycles, int64_t now, int64_t startedAt)
++{
++    if(startedAt <= 0 || now < startedAt)
++    {
++        startedAt = now;
++    }
++
++    int64_t elapsed = now - startedAt;
++    int64_t breathDuration = static_cast<int64_t>(periodMs) * cycles;
++    if(elapsed >= breathDuration)
++    {
++        setColor(red, green, blue);
++        return;
++    }
++
++    uint16_t phase = static_cast<uint16_t>(elapsed % periodMs);
 +    uint8_t eased = ease8InOutQuad(triangle8(phase, periodMs));
 +    uint8_t scale = static_cast<uint8_t>(8 + scale8(eased, 247));
 +    setColorScaled(red, green, blue, scale);
@@ -862,6 +912,11 @@ index 0000000..bfe4f16
 +    case Ws2812Effect::PartySparkle:
 +    case Ws2812Effect::ColorBurst:
 +    case Ws2812Effect::ElectricZap:
++    case Ws2812Effect::BreathSolidGreen:
++    case Ws2812Effect::BreathSolidRed:
++    case Ws2812Effect::BreathSolidBlue:
++    case Ws2812Effect::BreathSolidAmber:
++    case Ws2812Effect::BreathSolidWhite:
 +        duration = 5000;
 +        break;
 +    case Ws2812Effect::BlinkWhite:
@@ -999,6 +1054,16 @@ index 0000000..bfe4f16
 +        return "Color burst";
 +    case Ws2812Effect::ElectricZap:
 +        return "Electric zap";
++    case Ws2812Effect::BreathSolidGreen:
++        return "Breathe x3 then solid green";
++    case Ws2812Effect::BreathSolidRed:
++        return "Breathe x3 then solid red";
++    case Ws2812Effect::BreathSolidBlue:
++        return "Breathe x3 then solid blue";
++    case Ws2812Effect::BreathSolidAmber:
++        return "Breathe x3 then solid amber";
++    case Ws2812Effect::BreathSolidWhite:
++        return "Breathe x3 then solid white";
 +    default:
 +        return "Unknown";
 +    }
