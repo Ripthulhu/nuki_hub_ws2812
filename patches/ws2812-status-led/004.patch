@@ -1,9 +1,9 @@
 diff --git a/src/Ws2812StatusLed.h b/src/Ws2812StatusLed.h
 new file mode 100644
-index 0000000..7a0899c
+index 0000000..81f8887
 --- /dev/null
 +++ b/src/Ws2812StatusLed.h
-@@ -0,0 +1,143 @@
+@@ -0,0 +1,150 @@
 +#pragma once
 +
 +#include <Preferences.h>
@@ -67,6 +67,11 @@ index 0000000..7a0899c
 +    PartySparkle,
 +    ColorBurst,
 +    ElectricZap,
++    BreathSolidGreen,
++    BreathSolidRed,
++    BreathSolidBlue,
++    BreathSolidAmber,
++    BreathSolidWhite,
 +    Count
 +};
 +
@@ -106,11 +111,12 @@ index 0000000..7a0899c
 +    bool configureStrip();
 +    void deleteStrip();
 +    void clear();
-+    void render(Ws2812Effect effect, int64_t now);
++    void render(Ws2812Effect effect, int64_t now, int64_t startedAt);
 +    void renderBlink(uint8_t red, uint8_t green, uint8_t blue, uint16_t periodMs, int64_t now);
 +    void renderShortBlink(uint8_t red, uint8_t green, uint8_t blue, uint16_t intervalMs, uint16_t onMs, int64_t now);
 +    void renderPulse(uint8_t red, uint8_t green, uint8_t blue, uint16_t periodMs, int64_t now);
 +    void renderBreath(uint8_t red, uint8_t green, uint8_t blue, uint16_t periodMs, int64_t now);
++    void renderBreathThenSolid(uint8_t red, uint8_t green, uint8_t blue, uint16_t periodMs, uint8_t cycles, int64_t now, int64_t startedAt);
 +    void renderHeartbeat(uint8_t red, uint8_t green, uint8_t blue, uint16_t periodMs, int64_t now);
 +    void renderTwinkle(uint8_t red, uint8_t green, uint8_t blue, uint16_t periodMs, int64_t now);
 +    void renderFireFlicker(int64_t now);
@@ -124,7 +130,7 @@ index 0000000..7a0899c
 +    void setHsv(uint16_t hue, uint8_t saturation, uint8_t value);
 +    void setColor(uint8_t red, uint8_t green, uint8_t blue);
 +    void setColorScaled(uint8_t red, uint8_t green, uint8_t blue, uint8_t scale);
-+    Ws2812Effect currentEffect(int64_t now, uint8_t& brightness);
++    Ws2812Effect currentEffect(int64_t now, uint8_t& brightness, int64_t& startedAt);
 +    uint16_t momentaryDuration(Ws2812Trigger trigger, Ws2812Effect effect) const;
 +
 +    Preferences* _preferences = nullptr;
@@ -141,6 +147,7 @@ index 0000000..7a0899c
 +    uint8_t _momentaryBrightness = 32;
 +    int64_t _momentaryStartedAt = 0;
 +    int64_t _momentaryUntil = 0;
++    int64_t _activeTriggerStartedAt[WS2812_TRIGGER_COUNT] = {};
 +    bool _shortBlinkActive = false;
 +    int64_t _shortBlinkNextAt = 0;
 +    int64_t _shortBlinkOffAt = 0;
